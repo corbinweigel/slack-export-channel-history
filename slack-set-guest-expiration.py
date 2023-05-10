@@ -1,37 +1,55 @@
 import os
-import logging
-import logging.handlers
-import slack_sdk
-import csv
-from csv import DictReader
+import json
+import time
+import threading
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
-#Logs script output for review
-handler = logging.handlers.WatchedFileHandler(os.environ.get("LOGFILE", "slack-expiration.log"))
-formatter = logging.Formatter(logging.BASIC_FORMAT)
-handler.setFormatter(formatter)
-root = logging.getLogger()
-root.setLevel(os.environ.get("LOGLEVEL", "DEBUG"))
-root.addHandler(handler)
+# Set the access token for your Slack workspace
+slack_client = WebClient(token='slack-token-here')
 
-#Prompt for location of CSV file with userids
-get_guest_users_list_location = input("Where is your Guest User CSV file located?: ")
-guest_users = get_guest_users_list_location
+threads = []
 
-#Prompt for the desired expiration date
-print("When would you like the account to expire?")
-expiration_date = input("Date should be entered in Epoch Time. An Epoch Time converter can be found at https://www.epochconverter.com/: ")
-expiration_time = expiration_date
+def get_conversation_history(channel_id, conversation_history, cursor=None, page=1, rate_limit_retries=0):
+    conversation_history_endpoint = 'conversations.history'
+    params = {
+        'channel': channel_id,
+        'cursor': cursor,
+        'limit': 100
+    }
+    response = slack_client.conversations_history(**params)
+    if not response['ok']:
+        if response['error'] == 'ratelimited':
+            if rate_limit_retries == 6:
+                print("Maximum retries hit for rate limiting. Exiting.")
+                return
+            print("Rate limited, retrying in 30 seconds...")
+            time.sleep(30)
+            rate_limit_retries += 1
+            get_conversation_history(channel_id, conversation_history, cursor, page, rate_limit_retries)
+        else:
+            print(f"Error occurred: {response['error']}")
+            return
+    messages = response['messages']
+    conversation_history.extend(messages)
+    next_cursor = response.get('response_metadata', {}).get('next_cursor')
+    if next_cursor:
+        thread = threading.Thread(target=get_conversation_history, args=(channel_id, conversation_history, next_cursor, page+1, rate_limit_retries))
+        thread.start()
+        threads.append(thread)
+    print(f"Retrieving conversation history for {channel_id} - page {page} - {len(conversation_history)} messages retrieved", flush=True)
 
-#Update this value with your slack token 
-client = WebClient(token='')
+def export_channel_history(channel_id):
+    conversation_history = []
+    get_conversation_history(channel_id, conversation_history)
+    for thread in threads:
+        thread.join()
+    # Save conversation history to a JSON file
+    filename = f"{channel_id}.json"
+    with open(filename, 'w') as f:
+        json.dump(conversation_history, f)
 
-#Function that sets the expiration date. Update the team_id value with your team id (optional, per slack documentation)
-def set_expiration():
-    with open(f'{guest_users}') as user_list:
-        users = DictReader(user_list)
-        for user in users:
-            guest_user = (user['userid'])
-            response = client.admin_users_setExpiration(user_id=f"{guest_user}", expiration_ts=f"{expiration_time}", team_id="")
-set_expiration()
+if __name__ == '__main__':
+    channel_id = input("Enter the ID of the channel you want to export: ")
+    export_channel_history(channel_id)
+    
